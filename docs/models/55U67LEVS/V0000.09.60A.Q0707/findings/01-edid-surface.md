@@ -45,6 +45,19 @@ Partition **p24 `tvconfig`**, ext4, mounted read-only at **both** `/config` and
 | `MTK_EDID{1..4}_Persist.bin` | 512 B | **all zero** — purpose unverified |
 | `HDMI_EDID.bin` | 256 B | default |
 
+> **CORRECTION (measured later, same session): the INI is not the last word.**
+> The EDID actually presented on HDMI 1 is
+> `Hisense_EDID1_4k2k_Enhance.bin` — the *Enhanced HDMI mode* file — not the
+> `Mstar_EDID1_v2.1_*` file either INI names. Proven by reading the live EDID
+> over HDMI (`~/private/hisense/tools/read-edid-macos`) and byte-comparing it
+> with every candidate: exact match on the Hisense file, no match on either
+> Mstar file. Editing the Mstar pair therefore changed nothing, twice.
+> So: `Hisense_EDID{1..4}_4k2k_{Enhance,Standard}.bin` (per port, per HDMI
+> mode) is the effective selector on this build; `edid_cfg.ini` /
+> `model/Customer_1.ini` appear to be consumed somewhere else or overridden.
+> Everything below about the catalogue, the decoded advertisement and the
+> FreeSync variant still holds — only the *which file wins* answer changes.
+
 ## 3. Selection is an INI, and the two INIs disagree
 
 `/config/sys.ini` sets `gModelName = "/config/model/Customer_1.ini"`, and the
@@ -196,7 +209,47 @@ the range the file intends after it is installed.
 which is consistent with the vendor file being the one presented. Deployment
 needs root (§6).
 
-## 10. State
+## 10. Deployed: 1440p120 on HDMI 1 (2026-11-14)
+
+Written to the unit and verified live, via the one-shot root IPK:
+
+- both channel-1 files were backed up to `/APPS/.re_root/edid_backup/`, and a
+  restore script was left at `/APPS/.re_root/restore_edid.sh`;
+- `/config` was remounted rw, both `Mstar_EDID1_v2.1_4K_2K_3D_HDR*.bin` files
+  were replaced, then remounted ro;
+- readback proves the change: bytes at the CEA DTD slot are
+  `6fc200a0a0a0555030203500ba04a802001e` (2560x1440 @ 119.997 Hz) in both
+  files, and the range-limits descriptor is `18 78 0f c8 3c`
+  (24–120 Hz, 15–200 kHz, 600 MHz);
+- **only HDMI 1 was touched.** Ports 2–4 keep their factory files, which is
+  the deliberate fallback.
+
+The EDID used is a surgical edit of the unit's own vendor binary: the CEA DTD
+slot (previously 720x480) and the range descriptor, nothing else — the
+HF-VSDB, VIC list and audio descriptor are byte-identical, so the VRR
+behaviour that already works at 4K60 is untouched. A wholesale reuse of the
+pre-built `55u6nq` EDIDs was rejected for that reason: those rebuild the base
+identity, the audio block and the HF-VSDB.
+
+Whether the middleware re-reads the file at boot is the open question; the
+change is inert until a reboot.
+
+### Deployment mechanics worth keeping
+
+- `opkg` on this build extracts `data.tar.gz` with cwd `/APPS/pkgs`, so an
+  entry `./APPS/.re_root/x` lands at `/APPS/pkgs/APPS/.re_root/x`. Because of
+  that, payload files were staged with the **fetcher** into
+  `/APPS/.re_root/edid_new/` and the postinst copied them from there;
+  the package data tree only has to be non-empty.
+- The fetcher will not create directories — a small FaaS module has to
+  `mkdirSync` first.
+- There is **no root boot hook** on this build: no `/etc/rc.local`, no
+  `/var/local/otaTest.sh`, `rcS.utopia.linux` sources nothing writable, no
+  `serviceList.json` under `/APPS/pkgs`, and `/etc/scripts/mount_overlayfs.sh`
+  does not exist. A self-healing boot guard is therefore not available without
+  more research; staged rollout (one port) is the risk control instead.
+
+## 11. State
 
 **Nothing was written.** Every read above went through the FaaS worker as
 uid 314 (`fileRead`/`readdir`), no root involved, no mount changed.
@@ -209,3 +262,33 @@ Two practical notes for the next session:
   `readFileSync` **killed the worker** ("faas process error closed"). A chunked
   `openSync/readSync` scan of the same file works, but takes about a minute on
   this ARM CPU.
+
+## 12. Result: 1440p120 + VRR 48-120 working on HDMI 1 (2026-11-14)
+
+Applied variant **A** (1440p120 replacing the 1080p60 base DTD; range 24-120 Hz;
+VRR block left exactly as the vendor shipped it) to
+`Hisense_EDID1_4k2k_Enhance.bin`, rebooted, and verified twice:
+
+- **device-side byte read**: DTD2 `6fc200a0…` (2560x1440 @ 119.997 Hz), range
+  `18 78 0f c8 3c` (24-120 Hz, 15-200 kHz, 600 MHz);
+- **source-side read** with the Mac on HDMI 1 (`read-edid-macos`): same DTD2,
+  same range, 4K60 still the preferred timing.
+
+Owner-observed on the PS5 with that port: **1440p offered**, and **VRR
+48-120 Hz**. That is the goal met without touching the VRR block, the audio
+descriptor or the per-port CEC address — the whole change is 18 bytes of DTD +
+2 bytes of range descriptor + checksums.
+
+Two traps on the way there, both silent, both now documented:
+
+1. **opkg refuses a downgrade.** `--force-reinstall` on a lower `Version:` than
+   the installed one does nothing and the wrapper still returns success. The
+   apply package had to be rebuilt above the installed version.
+2. **An HDMI source hides the browser.** While a source (Mac/PS5) was plugged
+   into HDMI 1, pages loaded and executed but the panel showed the source, so
+   "the page never appeared" was a display-input issue, not a load failure.
+   Pages also render nothing if headless by design — `readapply.html` and
+   `recon_state.html` now print their JSON on screen.
+
+Rollback: `/APPS/.re_root/edid_backup/` holds the vendor files; the
+`edid-restore.ipk` path restores the Hisense file and both `Mstar_*` files.
